@@ -1,0 +1,9 @@
+__pycache__
+venv
+.idea
+config.py
+readme.txt
+ansible.sh
+notes.txt
+
+parameters.txt
