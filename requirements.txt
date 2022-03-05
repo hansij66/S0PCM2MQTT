@@ -1,0 +1,20 @@
+#python 3.x (tested with python 3.7)
+
+paho-mqtt
+# Debian: python3-paho-mqtt
+
+#persist-queue
+# https://pypi.org/project/persist-queue/
+# sudo pip3 install persist-queue --user
+
+pyserial
+
+pyyaml
+# Debian: python3-yaml
+
+
+##############################################################################
+# run as sudo <script>
+# as missing python libs which are not available via apt
+# are installed with "sudo pip3 install <package> --user" and libs end up in /root/.local/lib
+##############################################################################
