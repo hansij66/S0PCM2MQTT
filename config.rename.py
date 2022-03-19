@@ -28,6 +28,8 @@ SIMULATORFILE = "test/s0pcm.raw"
 # S0PCM module does not have a persistent memory
 MEASUREMENTFILE = "measurement.yaml"
 
+# All named inputs will be included in the MQTT message
+# All "None" inputs will be excluded from the MQTT message
 S0_DEFINITION = {
   "M1" : "jacuzzi",
   "M2" : None,

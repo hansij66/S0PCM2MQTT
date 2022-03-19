@@ -25,7 +25,7 @@
 
 """
 
-__version__ = "1.1.3"
+__version__ = "1.1.5"
 __author__ = "Hans IJntema"
 __license__ = "GPLv3"
 
@@ -147,8 +147,8 @@ def main():
   # Set status to offline
   t_mqtt.set_status(cfg.MQTT_TOPIC_PREFIX + "/status", "offline", retain=True)
 
-  # Todo check if MQTT queue is empty before setting stopper
   # Use a simple delay of 1sec before closing mqtt
+  # Should be normally enough to flush all MQTT messages
   time.sleep(1)
   mqtt_stopper.set()
 

@@ -187,8 +187,8 @@ class TaskReadSerial(threading.Thread):
 
       # In simulation mode, insert a delay
       if not cfg.PRODUCTION:
-        # 1sec delay mimics dsmr behaviour, which transmits every 1sec a telegram
-        time.sleep(1.0)
+        # 0.5sec delay mimics dsmr behaviour, but 2x as fast, which transmits every 1sec a telegram
+        time.sleep(0.5)
 
     logger.debug("<<")
 

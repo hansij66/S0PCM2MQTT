@@ -52,12 +52,15 @@ class ParseTelegrams(threading.Thread):
     self.__telegram = telegram
     self.__all_values = []
     self.__prev_all_values = []
+
+    # YAML measurement values read from file / stored to file
+    # These are initial values used when file is not present
     self.__measurements = {1: {'total': 0}, 2: {'total': 0}, 3: {'total': 0}, 4: {'total': 0}, 5: {'total': 0}, 'date': 0}
     self.__mqtt = mqtt
     self.__measurements_file_name = ""
-    self.__safe_counter = 0
+    self.__write_counter = 0
 
-    # Todo fix
+    # Todo fix? Make it configurable?
     BASEPATH = os.path.dirname(os.path.realpath(__file__))
     self.__measurements_file_name = BASEPATH + "/" + cfg.MEASUREMENTFILE
 
@@ -65,6 +68,9 @@ class ParseTelegrams(threading.Thread):
     logger.debug(">>")
 
   def __read_measurements(self):
+    """
+    Read stored values from file
+    """
     logger.debug(">>")
     # measurement['date'] = datetime.date.today()
 
@@ -76,20 +82,22 @@ class ParseTelegrams(threading.Thread):
       return
 
     logger.debug(f"YAML = {self.__measurements_file_name}")
-
     logger.debug("<<")
 
   def __write_measurements(self, throttle=False):
+    """
+    Write current values to file
+    """
     logger.debug(">>")
 
     # reduce nrof writes to disk
     if throttle:
-      self.__safe_counter += 1
-      if self.__safe_counter < 2:
+      self.__write_counter += 1
+      if self.__write_counter < 10:
         return
       else:
-        self.__safe_counter = 0
-        logger.debug("SAVE")
+        self.__write_counter = 0
+        logger.debug(f"Save values to {self.__measurements_file_name}")
 
     try:
       with open(self.__measurements_file_name, 'w') as f:
@@ -99,7 +107,12 @@ class ParseTelegrams(threading.Thread):
       return
 
   def __publish_telegram(self, json_dict):
-    # publish the dictionaries per topic
+    """
+    publish the values per topic
+
+    :param json_dict:
+    :return:
+    """
 
     # make resilient against double forward slashes in topic
     topic = cfg.MQTT_TOPIC_PREFIX
@@ -108,7 +121,15 @@ class ParseTelegrams(threading.Thread):
     self.__mqtt.do_publish(topic, message, retain=False)
 
   def __decode_telegram_element(self, element, jsonvalues):
+    """
+
+    :param element: the part of telegram to be decoded
+    :param jsonvalues: store the retrieved values
+    :return:
+    """
+
     # Split data into an array
+    # ID:21434:I:10:M1:0:100:M2:0:0:M3:0:100:M4:0:56:M5:0:1
     s0array = element.split(':')
 
     # Capture serial and remove from array (and "I:digit") - ID:21434:I:10:
@@ -137,12 +158,9 @@ class ParseTelegrams(threading.Thread):
   def __decode_telegrams(self, telegram):
     """
     Args:
-      :param list telegram:
+      :param list telegram: s0pcm telegram; preceded with counter
 
-    Returns:
-      :rtype: bool
-      True: if change detected wrt previous read value
-      False: no change detected wrt previous read value
+    Returns: None
 
     """
     logger.debug(f">>")
@@ -164,8 +182,15 @@ class ParseTelegrams(threading.Thread):
 
     self.__all_values.clear()
 
-    for element in telegram:
-      self.__decode_telegram_element(element, json_values)
+    # add a dummy 0th element, as all indices later on count from 1 to 5 (M1 to M5)
+    self.__all_values.append(0)
+
+    # This is a bit artificial, as telegram has only one element (the 5 s0pcm values)
+    # But this is the generic design I use for all parsers
+    #for element in telegram:
+    #  self.__decode_telegram_element(element, json_values)
+    # This is shorter.....
+    self.__decode_telegram_element(telegram[0], json_values)
 
     # store all M1..M5 values as list
     for i in range(1, 6):
@@ -178,15 +203,27 @@ class ParseTelegrams(threading.Thread):
     # Compare list with M1..M5 values with previous one
     # Skip if there are no changes
     if self.__all_values != self.__prev_all_values:
-      for i in range(5):
+      logger.debug(f"Change detected")
+      for i in range(1, 6):
         # Calculate difference between current and previous measurement
-        delta = self.__all_values[i] - self.__prev_all_values[i]
+        # Normal operation: Current value >= previous value
+        if self.__all_values[i] >= self.__prev_all_values[i]:
+          delta = self.__all_values[i] - self.__prev_all_values[i]
+          logger.debug(f"M{i}: delta={delta}")
+        else:
+          logger.warning(f"Power down detected for M{i}")
+          # Current value < previous value
+          # This happens when s0pcm module is powered down during operation
+          # which resets internal counters
+          delta = 0
+          self.__prev_all_values[i] = self.__all_values[i]
 
-        # Update total
+        # Update total by adding delta to previous total
         try:
-          self.__measurements[(i + 1)]["total"] += delta
+          self.__measurements[i]["total"] += delta
         except IndexError:
-          self.__measurements[(i + 1)]["total"] = self.__all_values[i]
+          # this should only happens when measurements file was non existent
+          self.__measurements[i]["total"] = self.__all_values[i]
 
       for i in range(1, 6):
         json_values["M" + str(i)] = self.__measurements[i]["total"]
@@ -200,7 +237,7 @@ class ParseTelegrams(threading.Thread):
 
       self.__publish_telegram(json_values)
       self.__measurements["date"] = ts
-      self.__write_measurements(True)
+      self.__write_measurements(throttle=True)
       self.__prev_all_values = copy.deepcopy(self.__all_values)
 
   def run(self):
@@ -225,5 +262,5 @@ class ParseTelegrams(threading.Thread):
         self.__decode_telegrams(telegram)
 
     # write measurements when closing
-    self.__write_measurements()
+    self.__write_measurements(throttle=False)
     logger.debug("<<")
