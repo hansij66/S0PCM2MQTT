@@ -25,6 +25,9 @@ Tested under Linux; there is no reason why it does not work under Windows.
 GPL v3
 
 ## Versions
+1.1.6:
+* Remove the unspecified Mx values from MQTT message
+
 1.1.5:
 * Fixed issue detecting power down of s0pcm module while s0pcm-mqtt parser is running
 

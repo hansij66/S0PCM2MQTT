@@ -25,7 +25,7 @@
 
 """
 
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 __author__ = "Hans IJntema"
 __license__ = "GPLv3"
 

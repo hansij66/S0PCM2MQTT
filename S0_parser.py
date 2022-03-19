@@ -233,7 +233,13 @@ class ParseTelegrams(threading.Thread):
       for i in range(1, 6):
         jsonkey = cfg.S0_DEFINITION["M" + str(i)]
         if jsonkey is not None:
+          # replace the Mx key:value pairs with new friendly name key:value
           json_values[jsonkey] = json_values.pop("M" + str(i))
+        else:
+          # remove the Mx key:value pairs which have a "None" as friendly name
+          json_values.pop("M" + str(i))
+
+      logger.debug(f"json_values = {json_values}")
 
       self.__publish_telegram(json_values)
       self.__measurements["date"] = ts
