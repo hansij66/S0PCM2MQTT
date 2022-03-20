@@ -25,6 +25,9 @@ Tested under Linux; there is no reason why it does not work under Windows.
 GPL v3
 
 ## Versions
+1.1.7:
+* Fix exit code (SUCCESS vs FAILURE)
+
 1.1.6:
 * Remove the unspecified Mx values from MQTT message
 
