@@ -25,7 +25,7 @@
 
 """
 
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 __author__ = "Hans IJntema"
 __license__ = "GPLv3"
 
@@ -134,7 +134,7 @@ def main():
   logger.debug(">>")
 
   # Set last will/testament
-  t_mqtt.will_set(cfg.MQTT_TOPIC_PREFIX + "/status", payload="offline", qos=cfg.MQTT_QOS, retain=True)
+  t_mqtt.will_set(cfg.MQTT_TOPIC_PREFIX + "/status", payload="interrupted", qos=cfg.MQTT_QOS, retain=True)
 
   # Start all threads
   t_mqtt.start()
@@ -144,7 +144,7 @@ def main():
 
   # Set status to online
   t_mqtt.set_status(cfg.MQTT_TOPIC_PREFIX + "/status", "online", retain=True)
-  t_mqtt.do_publish(cfg.MQTT_TOPIC_PREFIX + "/sw-version", f"{__version__}", retain=True)
+  t_mqtt.do_publish(cfg.MQTT_TOPIC_PREFIX + "/sw-version", f"main={__version__};mqtt={mqtt.__version__}", retain=True)
 
   # block till t_serial stops receiving telegrams/exits
   t_serial.join()
@@ -168,6 +168,8 @@ def main():
 # ------------------------------------------------------------------------------------
 if __name__ == '__main__':
   logger.debug("__main__: >>")
+
+  # register which signals should be handled, to have graceful exit
   signal.signal(signal.SIGINT, exit_gracefully)
   signal.signal(signal.SIGTERM, exit_gracefully)
 

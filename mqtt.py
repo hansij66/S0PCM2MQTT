@@ -9,6 +9,10 @@
 
   v1.0.0: initial version
   v1.0.1: add last will
+  V1.1.0: 31-7-2022: Add subscribing to MQTT server
+  v1.1.3: on_disconnect rc=1 (out of memory) stop program
+  v1.1.4: Add test for subscribing; whether message queue is set
+  V1.1.5: Fix MQTT_ERR_NOMEM
 
 
         This program is free software: you can redistribute it and/or modify
@@ -28,7 +32,7 @@
 
 """
 
-__version__ = "1.0.3"
+__version__ = "1.1.5"
 __author__ = "Hans IJntema"
 __license__ = "GPLv3"
 
@@ -47,8 +51,13 @@ script = os.path.splitext(script)[0]
 logger = logging.getLogger(script + "." + __name__)
 
 # Error values
-#MQTT_ERR_AGAIN = -1
+MQTT_ERR_AGAIN = -1
 MQTT_ERR_SUCCESS = 0
+
+# MQTT_ERR_NOMEM is not very accurate; is often similar to MQTT_ERR_CONN_LOST
+# eg stopping Mosquitto server generates a MQTT_ERR_NOMEM
+# However, there are cases that client freezes for ethernity after a MQTT_ERR_NOMEM
+# Implement a recover? With timeout? Try to reconnect?
 MQTT_ERR_NOMEM = 1
 MQTT_ERR_PROTOCOL = 2
 MQTT_ERR_INVAL = 3
@@ -96,7 +105,7 @@ connack_dict = {
 
 
 class mqttclient(threading.Thread):
-  def __init__(self, mqtt_broker, mqtt_port, mqtt_client_id, mqtt_rate, mqtt_qos, username, password, mqtt_stopper, threads_stopper):
+  def __init__(self, mqtt_broker, mqtt_port, mqtt_client_id, mqtt_rate, mqtt_qos, username, password, mqtt_stopper, worker_threads_stopper):
     """
 
     Args:
@@ -107,8 +116,12 @@ class mqttclient(threading.Thread):
       :param int mqtt_qos: MQTT QoS 0,1,2
       :param str username:
       :param str password:
-      :param threading.Event() mqtt_stopper:
-      :param threading.Event() threads_stopper: stopper event for other threads
+      :param threading.Event() mqtt_stopper: indicate to stop the mqtt thread; typically as last thread in main loop to flush out all mqtt messages
+      :param threading.Event() worker_threads_stopper: stopper event for other worker threads; typically the worker threads are
+             stopped in the main loop before the mqtt thread;but mqtt thread can also set this in case of failure
+
+      TODO REMOVE worker_threads_stopper, as it is always set when mqtt_stopper is set
+      (is that possible?)
 
     Returns:
       None
@@ -122,7 +135,7 @@ class mqttclient(threading.Thread):
     # self.__mqtt_client_id = mqtt_client_id
 
     self.__mqtt_stopper = mqtt_stopper
-    self.__threads_stopper = threads_stopper
+    self.__worker_threads_stopper = worker_threads_stopper
     self.__mqtt = paho.Client(mqtt_client_id)
     self.__run = False
 
@@ -130,6 +143,10 @@ class mqttclient(threading.Thread):
     self.__keepalive = 500
     self.__qos = mqtt_qos
     self.__maxqueuesize = 10000
+
+    # MQTT client tries to force a reconnection if
+    # Client remains disconnected for more than MQTT_CONNECTION_TIMEOUT seconds
+    self.__MQTT_CONNECTION_TIMEOUT = 60
 
     if mqtt_rate == 0:
       self.__mqtt_delay = 0
@@ -139,15 +156,31 @@ class mqttclient(threading.Thread):
     # Call back functions
     self.__mqtt.on_connect = self.__on_connect
     self.__mqtt.on_disconnect = self.__on_disconnect
+    self.__mqtt.on_message = self.__on_message
 
     # Uncomment if needed for debugging
 #    self.__mqtt.on_publish = self.__on_publish
 #    self.__mqtt.on_log = self.__on_log
+    self.__mqtt.on_subscribe = self.__on_subscribe
+    self.__mqtt.on_unsubscribe = self.__on_unsubscribe
 
+    # Not yet implemented
+    # self.__mqtt.on_unsubscribe = self.__on_unsubscribe
+
+    # Managed via __set_connected_flag()
+    # Keeps track of connected status
     self.__connected_flag = False
 
+    # Keep track how long client is disconnected
+    # When threshold is exceeded, try to recover
+    # In some cases, a MQTT_ERR_NOMEM is not recovered automatically
+    self.__disconnect_start_time = 0
+
+    # Maintain a mqtt message count
+    self.__mqtt_counter = 0
+
     # PAHO does implement a queue message for qos > 0
-    # This client has its own queue for *stupid*?? reasons
+    # This client has its own queue for *stupid* reasons (as I originally did not realize that PAHO has a queue)
     # - To allow for throttling of MQTT messages (but maybe this can be implemented via the call-back functions
     # - Initially, I did not realize that PAHO has a queue mechanism
     # - Too lazy to remove.....
@@ -157,6 +190,10 @@ class mqttclient(threading.Thread):
     self.__status_topic = None
     self.__status_payload = None
     self.__status_retain = None
+
+    # For processing subscribed messages
+    self.__message_trigger = None
+    self.__subscribed_queue = None
 
   def __del__(self):
     logger.info(f">>")
@@ -182,6 +219,18 @@ class mqttclient(threading.Thread):
       logger.info(f"Internet connectivity to MQTT broker {self.__mqtt_broker} at port {self.__mqtt_port} NOT yet available; Exception {e}")
       return False
 
+
+  def __set_connected_flag(self, flag=True):
+    logger.debug(f">> flag={flag}; current __connected_flag={self.__connected_flag}")
+
+    # if flag == False and __connected_flag == True; start trigger
+    if not flag and self.__connected_flag:
+      self.__disconnect_start_time = int(time.time())
+      logger.debug("Disconnect TIMER started")
+
+    self.__connected_flag = flag
+    return
+
   def __on_connect(self, client, userdata, flags, rc):
     """
     Callback: when the client receives a CONNACK response from the broker.
@@ -195,13 +244,18 @@ class mqttclient(threading.Thread):
     Returns:
       None
     """
+    logger.debug(f">>")
     if rc == 0:
-      logger.debug(f"Connected: client={client}; userdata={userdata}; flags={flags}; rc={rc}")
-      self.__connected_flag = True
+      logger.debug(f"Connected: client={client}; userdata={userdata}; flags={flags}; rc={rc}: {connack_dict[rc]}")
+      self.__set_connected_flag(True)
       self.__set_status()
+
+      # TODO
+      # Add subscribing, in case connection was lost
+
     else:
-      logger.error(f"userdata={userdata}; flags={flags}; rc={rc}; {connack_dict[rc]}")
-      self.__connected_flag = False
+      logger.error(f"userdata={userdata}; flags={flags}; rc={rc}: {connack_dict[rc]}")
+      self.__set_connected_flag(False)
 
   def __on_disconnect(self, client, userdata, rc):
     """
@@ -215,13 +269,33 @@ class mqttclient(threading.Thread):
     Returns:
       None
     """
-    logger.debug(f"Disconnected: userdata={userdata}; rc={rc}")
-    self.__connected_flag = False
+    logger.info(f"(Un)expected disconnect, userdata = {userdata}; rc = {rc}: {rc_dict[rc]}")
+    self.__set_connected_flag(False)
 
-    if rc == 0:
-      logger.debug(f"Disconnected")
-    else:
-      logger.error(f"Unexpected disconnect, rc = {rc}, {rc_dict[rc]}")
+    return
+
+#    if rc == 0:
+#      logger.debug(f"Disconnected")
+#    elif rc == 1:
+#      logger.error(f"Unexpected disconnect - TERMINATE, rc = {rc}, {rc_dict[rc]}")
+#      self.__worker_threads_stopper.set()
+#    else:
+#      logger.error(f"Unexpected disconnect, rc = {rc}, {rc_dict[rc]}")
+
+  def __on_message(self, client, userdata, message):
+    """
+    :param client:
+    :param userdata:
+    :param message: Queue()
+    :return:
+    """
+    logger.debug(f">> message = {message.topic}  {message.payload}")
+
+    self.__subscribed_queue.put(message)
+
+    # set event that message has been received
+    if self.__message_trigger != None:
+      self.__message_trigger.set()
 
   def __on_publish(self, client, userdata, mid):
     """
@@ -235,8 +309,27 @@ class mqttclient(threading.Thread):
     Returns:
       None
     """
-    None
-    # logger.debug( f"userdata={userdata}; mid={mid}" )
+    logger.debug(f"userdata={userdata}; mid={mid}")
+    return None
+
+  def __on_subscribe(self, client, obj, mid, granted_qos):
+    """
+    :param client:
+    :param obj:
+    :param mid:
+    :param granted_qos:
+    :return:
+    """
+    logger.debug(f">> Subscribed: {mid} {granted_qos}")
+
+  def __on_unsubscribe(self, client, obj, mid):
+    """
+    :param client:
+    :param obj:
+    :param mid:
+    :return:
+    """
+    logger.debug(f">> Unsubscribed: {mid}")
 
   def __on_log(self, client, obj, level, buf):
     """
@@ -255,12 +348,15 @@ class mqttclient(threading.Thread):
 
   def __set_status(self):
     """
-    Set status
+    Publish MQTT status message
     :return: None
     """
+    logger.debug(">>")
 
     if self.__status_topic is not None:
       self.do_publish(self.__status_topic, self.__status_payload, self.__status_retain)
+
+    return
 
   def set_status(self, topic, payload=None, retain=False):
     """
@@ -272,7 +368,7 @@ class mqttclient(threading.Thread):
     :param bool retain:
     :return: None
     """
-
+    logger.debug(">>")
     self.__status_topic = topic
     self.__status_payload = payload
     self.__status_retain = retain
@@ -309,10 +405,11 @@ class mqttclient(threading.Thread):
     Returns:
       None
     """
+    logger.debug(f">> TOPIC={topic}; MESSAGE={message}")
 
     # Queue is used to allow for throttling of MQTT messages
     self.__queue.put((topic, message, retain))
-    # logger.debug(f"{self.__queue.qsize()} MQTT messages are queued; Queue message: topic={topic}; message={message}")
+    logger.debug(f"{self.__queue.qsize()} MQTT messages are queued")
 
   def __do_mqtt(self):
     """
@@ -324,15 +421,13 @@ class mqttclient(threading.Thread):
     logger.debug(">>")
 
     # Check connectivity
-    if self.__connected_flag is False:
+    if not self.__connected_flag:
       logger.warning(f"No connection with MQTT Broker; {self.__queue.qsize()} messages queued")
       return None
 
     logger.info(f"Connection with MQTT Broker; {self.__queue.qsize()} messages queued")
 
-    # Maintain a mqtt message count
-    counter = 0
-    while not self.__mqtt_stopper.is_set():
+    while not self.__mqtt_stopper.is_set() and self.__connected_flag:
 
       # queue.get is set to blocking, with timeout of 1sec, to have a
       # regular check on stopper
@@ -341,16 +436,84 @@ class mqttclient(threading.Thread):
         logger.debug(f"Received from Queue: TOPIC={topic} MESSAGE={message};...{self.__queue.qsize()} message(s) left in queued")
       except queue.Empty:
         continue
+        #return None
 
-      self.__mqtt.publish(topic, message, qos=self.__qos, retain=retainflag)
-      counter += 1
+      try:
+        mqttmessageinfo = self.__mqtt.publish(topic, message, qos=self.__qos, retain=retainflag)
+        self.__mqtt_counter += 1
+
+        if mqttmessageinfo.rc != MQTT_ERR_SUCCESS:
+          logger.warning(f"MQTT publish was not successfull, rc = {mqttmessageinfo.rc}: {rc_dict[mqttmessageinfo.rc]}")
+      except ValueError:
+        logger.warning("")
+
+      """
+      Returns a MQTTMessageInfo which expose the following attributes and methods:
+
+      - rc, the result of the publishing. It could be MQTT_ERR_SUCCESS to indicate success, 
+      MQTT_ERR_NO_CONN if the client is not currently connected, 
+      or MQTT_ERR_QUEUE_SIZE when max_queued_messages_set is used to indicate that message is neither queued nor sent.
+      
+      - mid is the message ID for the publish request. 
+      The mid value can be used to track the publish request by checking against the mid argument in the on_publish() callback 
+      if it is defined. wait_for_publish may be easier depending on your use-case.
+      
+      - wait_for_publish() will block until the message is published. 
+      It will raise ValueError if the message is not queued (rc == MQTT_ERR_QUEUE_SIZE).
+      
+      - is_published returns True if the message has been published. 
+      It will raise ValueError if the message is not queued (rc == MQTT_ERR_QUEUE_SIZE).
+      
+      A ValueError will be raised if topic is None, has zero length or is invalid (contains a wildcard), 
+      if qos is not one of 0, 1 or 2, or if the length of the payload is greater than 268435455 bytes.
+      """
 
       # Throttle mqtt rate
       if self.__mqtt_delay > 0.0:
+        logger.debug(f"THROTTLE with {self.__mqtt_delay}")
         time.sleep(self.__mqtt_delay)
 
     # stopper is set...
-    logger.info(f"Shutting down MQTT Client... {counter} MQTT messages have been published")
+    if self.__mqtt_stopper.is_set():
+      logger.info(f"Shutting down MQTT Client... {self.__mqtt_counter} MQTT messages have been published")
+
+    return
+
+  def set_message_trigger(self, subscribed_queue, trigger=None):
+    """
+    Call before subscribing
+    The received messages are stored in a queue
+    If a message is received, trigger event will be set
+
+    :param subscribed_queue: Queue() - as received by on_message (topic, payload,..)
+    :param trigger: threading.Event(); OPTIONAL: to indicate that message has been received
+    :return:
+    """
+
+    self.__message_trigger = trigger
+    self.__subscribed_queue = subscribed_queue
+    return
+
+  def subscribe(self, topic):
+    logger.debug(f">> topic = {topic}")
+
+    if self.__subscribed_queue is None:
+      logger.error(f"Subscription message queue has not been set --> call set_message_trigger")
+      return
+
+    # Subscribing will not work if client is not connected
+    # Wait till there is a connection
+    while not self.__connected_flag and not self.__mqtt_stopper.is_set():
+      logger.warning(f"No connection with MQTT Broker; cannot subscribe...wait for connection")
+      time.sleep(0.1)
+
+    # TODO...store subscriptions, and subscribe again in on_connect (in case connection was lost)
+    # https://www.eclipse.org/paho/index.php?page=clients/python/docs/index.php
+    self.__mqtt.subscribe(topic, self.__qos)
+
+  def unsubscribe(self, topic):
+    logger.debug(f">> topic = {topic}")
+    self.__mqtt.unsubscribe(topic)
 
   def run(self):
     logger.info(f"Broker = {self.__mqtt_broker}>>")
@@ -367,7 +530,7 @@ class mqttclient(threading.Thread):
       if delay > 3600:
         logger.error(f"No internet connection - EXIT")
         self.__mqtt_stopper.set()
-        self.__threads_stopper.set()
+        self.__worker_threads_stopper.set()
         return
 
     try:
@@ -377,22 +540,39 @@ class mqttclient(threading.Thread):
       logger.exception(f"Exception {format(e)}")
       self.__mqtt.disconnect()
       self.__mqtt_stopper.set()
-      self.__threads_stopper.set()
+      self.__worker_threads_stopper.set()
       return
 
     else:
+      logger.info(f"start mqtt loop...")
       self.__mqtt.loop_start()
-      logger.info(f"mqtt loop started...")
+      logger.debug(f"mqtt loop started...")
 
     # Start infinite loop which sends queued messages every second
     while not self.__mqtt_stopper.is_set():
       self.__do_mqtt()
+
+      # Check connection status
+      # If disconnected time exceeds threshold
+      # then reconnect
+      if not self.__connected_flag:
+        disconnect_time = int(time.time()) - self.__disconnect_start_time
+        logger.debug(f"Disconnect TIMER = {disconnect_time}")
+        if disconnect_time > self.__MQTT_CONNECTION_TIMEOUT:
+          try:
+            self.__mqtt.reconnect()
+          except Exception as e:
+            logger.exception(f"Exception {format(e)}")
+
+            # reconnect failed....reset disconnect time, and retry after self.__MQTT_CONNECTION_TIMEOUT
+            self.__disconnect_start_time = int(time.time())
+
       time.sleep(0.1)
 
     # Close mqtt broker
-    logger.debug(f"CLose down MQTT client & connection to broker")
+    logger.debug(f"Close down MQTT client & connection to broker")
     self.__mqtt.loop_stop()
     self.__mqtt.disconnect()
     self.__mqtt_stopper.set()
-    self.__threads_stopper.set()
+    self.__worker_threads_stopper.set()
     logger.info(f"<<")

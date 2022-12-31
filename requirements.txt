@@ -8,6 +8,7 @@ paho-mqtt
 # sudo pip3 install persist-queue --user
 
 pyserial
+# add root (or user which runs script) to group dialout  (/etc/groups)
 
 pyyaml
 # Debian: python3-yaml
